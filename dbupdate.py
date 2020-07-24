@@ -33,10 +33,20 @@ if __name__ == '__main__':
             pbs_info = get_info(job.jid)
             if pbs_info:
                 logging.info(f'updating state for {jid}')
-                walltime = calc_walltime(pbs_info['resources_used']['walltime'])
-                raw_stime = pbs_info.get('stime') or pbs_info.get('ctime')
-                stime = datetime.strptime(raw_stime, '%a %b  %d %H:%M:%S %Y')
-                state = pbs_info['job_state']
-                job.walltime = walltime
-                job.stime = stime
-                job.state = state
+                try:
+                    walltime = calc_walltime(pbs_info['resources_used']['walltime'])
+                    job.walltime = walltime
+                except:
+                    logging.info('can not get walltime')
+                try:
+                    raw_stime = pbs_info.get('stime') or pbs_info.get('ctime')
+                    stime = datetime.strptime(raw_stime, '%a %b  %d %H:%M:%S %Y')
+                    job.stime = stime
+                except:
+                    logging.info('can not get stime')
+                try:
+                    state = pbs_info['job_state']
+                    job.state = state
+                except:
+                    logging.info('can not get state')
+
