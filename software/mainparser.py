@@ -2,24 +2,80 @@
 main parser
 """
 # author: thuhak.zhou@nio.com
-from argparse import ArgumentParser
-from weakref import WeakValueDictionary
-import logging
-from logging.handlers import RotatingFileHandler
 import json
 import os
-from os.path import dirname, join, abspath, isfile, isdir
-from string import ascii_letters, digits
+import logging
 import pwd
 import time
+import subprocess
+import re
+from argparse import ArgumentParser
+from weakref import WeakValueDictionary
+from logging.handlers import RotatingFileHandler
+from os.path import dirname, join, abspath, isfile, isdir
+from string import ascii_letters, digits
+from collections import namedtuple, OrderedDict
 
-import sh
-
-__version__ = '1.0.0'
+__version__ = '4.0.1'
 __author__ = 'thuhak.zhou@nio.com'
+
+Param = namedtuple('Param', ['flag', 'name', 'value'])
+
+
+class Qsub:
+    """
+    qsub command
+    """
+    para_map = {
+        'jobname': 'N',
+        'waitfor': 'W',
+        'umask': 'W',
+        'priority': 'p',
+        'select': 'l',
+        'place': 'l',
+        'resource': 'l',
+        'queue': 'q',
+        'email': 'M',
+        'project': 'P',
+        'variable': 'v',
+        'output': 'o',
+        'date': 'a'
+    }
+
+    def __init__(self, logger, script=None):
+        self.parameters = OrderedDict()
+        self.script = script
+        self.logger = logger
+
+    def __setattr__(self, key, value):
+        if key in self.para_map:
+            parm = Param(self.para_map[key], key, value)
+            super().__setattr__(key, parm)
+            self.parameters[key] = parm
+        else:
+            super().__setattr__(key, value)
+
+    def __delattr__(self, item):
+        self.parameters.pop(item, None)
+        super().__delattr__(item)
+
+    @property
+    def command(self):
+        params = ' '.join(f'-{p.flag} {p.value}' for p in self.parameters.values())
+        return f'/opt/pbs/bin/qsub {params} {self.script}'
+
+    def run(self):
+        ret, data = subprocess.getstatusoutput(self.command)
+        if ret != 0:
+            self.logger.error(f'qsub error: {data}')
+            exit(-1)
+        return data
 
 
 class classproperty:
+    """
+    cache data in class
+    """
     def __init__(self, func):
         self.func = func
 
@@ -40,10 +96,7 @@ class MainParser:
     """
     _all_software = WeakValueDictionary()
     logger = logging.getLogger('pbs_sub')
-    # fix pbs server config here
-    PBS_SERVER = 'PBS_SERVER'
-    MAIL = 'xx.com'
-    QSUB = sh.Command('/opt/pbs/bin/qsub')
+    PBS_SERVER = 'p-hfhq-hpc-manage-01'
     user = pwd.getpwuid(os.getuid())[0]
     script_base = join(dirname(abspath(__file__)), 'run_scripts')
 
@@ -55,7 +108,10 @@ class MainParser:
         self.parser.add_argument('-l', '--log_level', choices=['error', 'info', 'debug'], default='info',
                                  help='logging level')
         self.parser.add_argument('-W', '--wait', metavar='JOB_ID', help='depend on which job')
+        self.parser.add_argument('-p', '--priority', type=int, help='priority of job, range:-1024-1023')
+        self.parser.add_argument('-P', '--project', help='name of your project, default is the name of the software')
         self.parser.add_argument('--free_cores', action='store_true', help='show free cpu cores by queue')
+        self.parser.add_argument('--keep', action='store_true', help='keep running until job done')
         software = self.parser.add_subparsers(dest='software', help='software list')
         for soft in self._all_software:
             cls = self._all_software[soft]
@@ -70,12 +126,12 @@ class MainParser:
         raise NotImplementedError
 
     @classmethod
-    def handle(cls, args, base_args) -> list:
+    def handle(cls, args, qsub: Qsub) -> list:
         """
         abc interface, implement this method in subclass
 
         args: argument args
-        base_args: all argument provided by main parser
+        base_args: qsub instance
         :return all job ids in list format, or you may just return None
         """
         raise NotImplementedError
@@ -107,9 +163,8 @@ class MainParser:
         """
         cls.logger.debug('getting pbs node info')
         try:
-            PBSNODES = sh.Command('/opt/pbs/bin/pbsnodes')
-            raw_nodedata = json.loads(PBSNODES('-aS', '-F', 'json').stdout)['nodes']
-            raw_nodedata2 = json.loads(PBSNODES('-Saj', '-F', 'json').stdout)['nodes']
+            raw_nodedata = json.loads(subprocess.getoutput('/opt/pbs/bin/pbsnodes -Sav -F json'))['nodes']
+            raw_nodedata2 = json.loads(subprocess.getoutput('/opt/pbs/bin/pbsnodes -Sajv -F json'))['nodes']
             for k in raw_nodedata.keys():
                 raw_nodedata[k].update(raw_nodedata2[k])
             return raw_nodedata
@@ -124,10 +179,7 @@ class MainParser:
         """
         cls.logger.debug('getting pbs job info')
         try:
-            QSTAT = sh.Command('/opt/pbs/bin/qstat')
-            raw_data = sh.grep(QSTAT('-f', '-F', 'json'), '-v', 'Submit_arguments').stdout
-            job_data = json.loads(raw_data)['Jobs']
-            return job_data
+            return json.loads(subprocess.getoutput(f'/opt/pbs/bin/qstat -f -F json'))['Jobs']
         except Exception as e:
             cls.logger.error(f'PBS error, can not get pbs job info, reason: {str(e)}')
             exit(-1)
@@ -157,6 +209,8 @@ class MainParser:
         pbsdata = cls.pbs_nodes_data
         ret = defaultdict(int)
         for node in pbsdata.values():
+            if node.get('State') in ('down', 'offline'):
+                continue
             queue = node.get('queue')
             if queue:
                 ret[queue] += int(node.get('ncpus f/t').split('/')[0])
@@ -174,8 +228,7 @@ class MainParser:
     def get_jid_info(cls, jid: str) -> dict:
         cls.logger.debug(f'getting job information for {jid}')
         try:
-            QSTAT = sh.Command('/opt/pbs/bin/qstat')
-            raw_info = sh.grep(QSTAT('-f', '-F', 'json', jid), '-v', 'Submit_arguments').stdout #pbs bug fix
+            raw_info = subprocess.getoutput(f'/opt/pbs/bin/qstat -fx -F json {jid}')
             job_info = json.loads(raw_info)['Jobs'][jid]
             return job_info
         except json.decoder.JSONDecodeError:
@@ -204,9 +257,19 @@ class MainParser:
                 ret = ret.replace(c, '_')
         return ret
 
-    @staticmethod
-    def get_ncpu(queue: str) -> int:
-        return 16 if queue == 'cfdbs' else 32
+    @classmethod
+    def get_ncpu(cls, queue: str) -> int:
+        for node in cls.pbs_nodes_data.values():
+            if node['queue'] == queue and node['ncpus'] != 0:
+                return node['ncpus']
+
+    @classmethod
+    def get_mem(cls, queue: str) -> int:
+        pat = re.compile(r'\d+')
+        for node in cls.pbs_nodes_data.values():
+            memory = int(pat.findall(node['Memory'])[0])
+            if node['queue'] == queue and memory != 0:
+                return memory
 
     @staticmethod
     def jid_to_int(jid: str) -> int:
@@ -224,7 +287,8 @@ class MainParser:
         handlers = [logging.StreamHandler()]
         logdir = '/var/log/pbs_sub'
         if isdir(logdir):
-            loghandler = RotatingFileHandler(join(logdir, self.user + '.log'), maxBytes=10*1024*1024, backupCount=3, encoding='utf-8')
+            loghandler = RotatingFileHandler(join(logdir, self.user + '.log'), maxBytes=10 * 1024 * 1024, backupCount=3,
+                                             encoding='utf-8')
             handlers.append(loghandler)
         logging.basicConfig(level=log_level, format='%(asctime)s [%(levelname)s]: %(message)s',
                             datefmt="%Y-%m-%d %H:%M:%S", handlers=handlers)
@@ -237,20 +301,26 @@ class MainParser:
                 space = ' ' * (ali - len(q))
                 print(f'{q}:{space}{c}')
             return
+        qsub = Qsub(self.logger)
         software = args.software
-        email = f'{self.user}@{self.MAIL}'
+        qsub.email = self.user + '@nio.com'
+        qsub.project = args.project or software
         waitfor = args.wait
-        base_args = ['-m', 'abe', '-M', email]
         if waitfor:
             if '.' not in waitfor:
                 waitfor = waitfor + '.' + self.PBS_SERVER
             if not self.check_jobid(waitfor):
                 self.logger.debug(f'invalid job id {waitfor}')
                 exit(1)
-            var_w = f'depend=afterok:{waitfor}'
-            base_args.extend(['-W', var_w])
+            qsub.waitfor = f'depend=afterok:{waitfor}'
+        priority = args.priority
+        if priority:
+            if priority >= 1024 or priority < -1024:
+                self.logger.error('priority out of range')
+                exit(3)
+            qsub.priority = priority
         if software in self._all_software:
-            jids = self._all_software[software].handle(args, base_args)
+            jids = self._all_software[software].handle(args, qsub)
             if not jids:
                 return
             time.sleep(1)
@@ -262,5 +332,15 @@ class MainParser:
                 if comment:
                     info += f',comment: {comment}'
                 self.logger.info(info)
+            while jids and args.keep:
+                time.sleep(5)
+                for jid in jids[:]:
+                    job_info = self.get_jid_info(jid)
+                    job_stat = job_info.get('job_state')
+                    if job_stat in ('H', 'R', 'Q', 'S', 'E'):
+                        self.logger.info(f'{jid} is not finished')
+                        break
+                    else:
+                        jids.remove(jid)
         else:
             self.parser.print_help()
