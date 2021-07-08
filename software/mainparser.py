@@ -96,7 +96,6 @@ class MainParser:
     """
     _all_software = WeakValueDictionary()
     logger = logging.getLogger('pbs_sub')
-    PBS_SERVER = 'p-hfhq-hpc-manage-01'
     user = pwd.getpwuid(os.getuid())[0]
     script_base = join(dirname(abspath(__file__)), 'run_scripts')
 
@@ -183,6 +182,16 @@ class MainParser:
         except Exception as e:
             cls.logger.error(f'PBS error, can not get pbs job info, reason: {str(e)}')
             exit(-1)
+
+    @classproperty
+    def PBS_SERVER(cls):
+        """
+        get current pbs server
+        """
+        with open('/etc/pbs.conf') as f:
+            for l in f:
+                if l.startswith('PBS_SERVER'):
+                    return l.strip().split('=')[1]
 
     @classmethod
     def free_cores(cls, queue: str) -> int:
