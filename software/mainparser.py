@@ -16,7 +16,9 @@ from os.path import dirname, join, abspath, isfile, isdir
 from string import ascii_letters, digits
 from collections import namedtuple, OrderedDict
 
-__version__ = '4.0.1'
+import jmespath
+
+__version__ = '4.1.0'
 __author__ = 'thuhak.zhou@nio.com'
 
 Param = namedtuple('Param', ['flag', 'name', 'value'])
@@ -39,13 +41,16 @@ class Qsub:
         'project': 'P',
         'variable': 'v',
         'output': 'o',
-        'date': 'a'
+        'date': 'a',
+        'rerun': 'r',
+        'remove': 'R'
     }
 
-    def __init__(self, logger, script=None):
+    def __init__(self, logger, script=None, remote=False):
         self.parameters = OrderedDict()
         self.script = script
         self.logger = logger
+        self.remote = '--' if remote else ''
 
     def __setattr__(self, key, value):
         if key in self.para_map:
@@ -62,7 +67,7 @@ class Qsub:
     @property
     def command(self):
         params = ' '.join(f'-{p.flag} {p.value}' for p in self.parameters.values())
-        return f'/opt/pbs/bin/qsub {params} {self.script}'
+        return f'/opt/pbs/bin/qsub {params} {self.remote} {self.script}'
 
     def run(self):
         ret, data = subprocess.getstatusoutput(self.command)
@@ -104,6 +109,7 @@ class MainParser:
         self.parser = ArgumentParser(description=f"This script is used for pbs job submission, version: {__version__}",
                                      epilog=f'if you have any question or suggestion, please contact with {__author__}')
         self.parser.add_argument('-n', '--name', help='job name')
+        self.parser.add_argument('-N', '--node', help='job run at specific node')
         self.parser.add_argument('-l', '--log_level', choices=['error', 'info', 'debug'], default='info',
                                  help='logging level')
         self.parser.add_argument('-W', '--wait', metavar='JOB_ID', help='depend on which job')
@@ -162,7 +168,7 @@ class MainParser:
         """
         cls.logger.debug('getting pbs node info')
         try:
-            raw_nodedata = json.loads(subprocess.getoutput('/opt/pbs/bin/pbsnodes -Sav -F json'))['nodes']
+            raw_nodedata = json.loads(subprocess.getoutput('/opt/pbs/bin/pbsnodes -av -F json'))['nodes']
             raw_nodedata2 = json.loads(subprocess.getoutput('/opt/pbs/bin/pbsnodes -Sajv -F json'))['nodes']
             for k in raw_nodedata.keys():
                 raw_nodedata[k].update(raw_nodedata2[k])
@@ -184,6 +190,18 @@ class MainParser:
             exit(-1)
 
     @classproperty
+    def pbs_queue_data(cls):
+        """
+        get pbs queue setting info
+        """
+        cls.logger.debug('get pbs queue info')
+        try:
+            return json.loads(subprocess.getoutput('/opt/pbs/bin/qstat -Qf -F json'))["Queue"]
+        except Exception as e:
+            cls.logger.error(f'PBS error, can not get pbs queue info, reason: {str(e)}')
+            exit(-1)
+
+    @classproperty
     def PBS_SERVER(cls):
         """
         get current pbs server
@@ -194,36 +212,33 @@ class MainParser:
                     return l.strip().split('=')[1]
 
     @classmethod
-    def free_cores(cls, queue: str) -> int:
-        """
-        get free cores in queue
-        """
-        count = 0
-        cls.logger.debug(f'getting free cores in {queue}')
-        pbsdata = cls.pbs_nodes_data
-        for node in pbsdata.values():
-            if node.get('queue') == queue:
-                core_free = int(node.get('ncpus f/t').split('/')[0])
-                count += core_free
-        cls.logger.debug(f'number of free cores in {queue} is {count}')
-        return count
-
-    @classmethod
-    def all_free_cores(cls) -> dict:
+    def all_free_cores(cls) -> tuple:
         """
         get all free cores in all queues
         """
         from collections import defaultdict
         cls.logger.debug('getting free cores')
         pbsdata = cls.pbs_nodes_data
-        ret = defaultdict(int)
-        for node in pbsdata.values():
-            if node.get('State') in ('down', 'offline'):
+        free = defaultdict(int)
+        total = defaultdict(int)
+        offline = defaultdict(int)
+        for k, node in pbsdata.items():
+            queues_raw = node['resources_available'].get('Qlist')
+            queue_raw = node.get('queue')
+            if queues_raw:
+                queues = queues_raw.split(',')
+            elif queue_raw:
+                queues = [queue_raw]
+            else:
                 continue
-            queue = node.get('queue')
-            if queue:
-                ret[queue] += int(node.get('ncpus f/t').split('/')[0])
-        return ret
+            cpu_free, cpu_total = [int(x) for x in node.get('ncpus f/t').split('/')]
+            for q in queues:
+                if node.get('State') in ('down', 'offline'):
+                    offline[q] += cpu_total
+                    continue
+                free[q] += cpu_free
+                total[q] += cpu_total
+        return free, total, offline
 
     @classmethod
     def check_jobid(cls, jid: str) -> bool:
@@ -268,17 +283,18 @@ class MainParser:
 
     @classmethod
     def get_ncpu(cls, queue: str) -> int:
-        for node in cls.pbs_nodes_data.values():
-            if node['queue'] == queue and node['ncpus'] != 0:
-                return node['ncpus']
+        """
+        set default_chunk.cpus first
+        """
+        return jmespath.search(f'{queue}.default_chunk.ncpus', cls.pbs_queue_data)
 
     @classmethod
     def get_mem(cls, queue: str) -> int:
-        pat = re.compile(r'\d+')
-        for node in cls.pbs_nodes_data.values():
-            memory = int(pat.findall(node['Memory'])[0])
-            if node['queue'] == queue and memory != 0:
-                return memory
+        """
+        set default_chunk.mem = INTgb first
+        """
+        chunk = jmespath.search(f'{queue}.default_chunk.mem', cls.pbs_queue_data)
+        return int(re.findall(r'\d+', chunk)[0])
 
     @staticmethod
     def jid_to_int(jid: str) -> int:
@@ -304,11 +320,13 @@ class MainParser:
         for handler in logging.root.handlers:
             handler.addFilter(logging.Filter('pbs_sub'))
         if args.free_cores:
-            free_cores = self.all_free_cores()
-            ali = max([len(x) for x in free_cores.keys()]) + 3
-            for q, c in free_cores.items():
-                space = ' ' * (ali - len(q))
-                print(f'{q}:{space}{c}')
+            from terminaltables import AsciiTable
+            free_cores, total_cores, offline_cores = self.all_free_cores()
+            table_data = [['queue', 'free_cores', 'offline_cores', 'total_cores']]
+            for q in total_cores.keys():
+                table_data.append([q, free_cores[q], offline_cores[q], total_cores[q]])
+            table = AsciiTable(table_data)
+            print(table.table)
             return
         qsub = Qsub(self.logger)
         software = args.software
@@ -328,6 +346,9 @@ class MainParser:
                 self.logger.error('priority out of range')
                 exit(3)
             qsub.priority = priority
+        node = args.node
+        if node:
+            qsub.resource = f'host={node}'
         if software in self._all_software:
             jids = self._all_software[software].handle(args, qsub)
             if not jids:
