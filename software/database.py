@@ -1,26 +1,24 @@
 # author: thuhak.zhou@nio.com
 from contextlib import contextmanager
-from collections import Iterable
 import enum
+import os
 
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, JSON, Enum
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 
+dbhost = os.environ.get('PBS_SUB_DB')
+dbpass = os.environ.get('PBS_SUB_DB_PW')
 
-# add database config here
-dbconfig = {'user': 'USER', 'pass': 'PASSWORD', 'host': 'HOST', 'port': 'PORT', 'db': 'DB'}
-
-engine_path = 'mysql+pymysql://{user}:{pass}@{host}:{port}/{db}'.format(**dbconfig)
-Base = declarative_base()
+engine_path = f'mysql+pymysql://hpc:{dbpass}@{dbhost}/hpc'
 engine = create_engine(engine_path, encoding='utf-8', echo=False,
                        pool_size=10, max_overflow=10, pool_recycle=7200, pool_pre_ping=True)
-DBSession = sessionmaker(bind=engine)
+Base = declarative_base()
 
 
 @contextmanager
 def session_scope():
-    session = DBSession()
+    session = sessionmaker(bind=engine)()
     try:
         yield session
         session.commit()
@@ -29,32 +27,6 @@ def session_scope():
         raise e
     finally:
         session.close()
-
-
-class BaseModel(Base):
-    __abstract__ = True
-    hide = set()
-    other_prop = set()
-
-    def to_dict(self, rel=True, hide=True) -> dict:
-        if hide:
-            res = {column.key: getattr(self, attr)
-                   for attr, column in self.__mapper__.c.items() if attr not in self.hide}
-        else:
-            res = {column.key: getattr(self, attr)
-                   for attr, column in self.__mapper__.c.items()}
-        for prop in self.other_prop:
-            if hide and prop in self.hide:
-                continue
-            res[prop] = getattr(self, prop)
-        if rel:
-            for attr, relation in self.__mapper__.relationships.items():
-                item = getattr(self, attr)
-                if isinstance(item, Iterable):
-                    res[attr] = [i.to_dict(rel=False) for i in item]
-                else:
-                    res[attr] = item.to_dict(rel=False)
-        return res
 
 
 class JobStat(enum.Enum):
@@ -76,17 +48,17 @@ class JobStat(enum.Enum):
     X = 12
 
 
-class Job(BaseModel):
+class Job(Base):
     """
     PBS job table
     """
     __tablename__ = 'job'
-
     jid = Column(Integer, primary_key=True, autoincrement=False, comment='pbs job id')
     software = Column(String(64), index=True, comment='software name')
     module = Column(String(1024), server_default='main', comment='software module')
     user = Column(String(64), comment='submit user')
     jobfile = Column(String(1024), comment='job file')
+    project = Column(String(128), comment='project')
     cores = Column(Integer, index=True, comment='cpu cores')
     queue = Column(String(32), comment='pbs queue')
     stime = Column(DateTime, comment='job start time')
@@ -96,4 +68,5 @@ class Job(BaseModel):
     extra = Column(JSON, comment='extra data, json format')
 
 
-# Base.metadata.create_all(engine)
+if __name__ == '__main__':
+    Base.metadata.create_all(engine)
