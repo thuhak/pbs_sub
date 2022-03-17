@@ -13,7 +13,7 @@ from collections import namedtuple, OrderedDict
 from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from math import ceil
-from os.path import dirname, join, abspath, isfile, isdir
+from os.path import dirname, join, abspath, isdir
 from string import ascii_letters, digits
 from weakref import WeakValueDictionary
 
@@ -21,11 +21,12 @@ import jmespath
 
 from .database import session_scope, Job
 
-__version__ = '4.3.0'
+__version__ = '5.0.0'
 __author__ = 'thuhak.zhou@nio.com'
 
 user = pwd.getpwuid(os.getuid())[0]
 groups = set(subprocess.getoutput('groups').split())
+email = os.environ.get('EMAIL', f'{user}@nio.com')
 
 pbs_servers = {
     'A': 'sh',
@@ -46,6 +47,23 @@ def jid_to_int(jid: str) -> int:
     return int(jid.split('.')[0])
 
 
+def fixpath(path):
+    # TODO: use better algorithm
+    for c in '#!&':
+        path = path.replace(c, f'\\{c}')
+    return path
+
+
+class Resource:
+    """
+    pbs resource
+    """
+    __slots__ = ['value']
+
+    def __init__(self, value):
+        self.value = value
+
+
 class Qsub:
     """
     qsub command
@@ -58,7 +76,6 @@ class Qsub:
         'priority': 'p',
         'select': 'l',
         'place': 'l',
-        'resource': 'l',
         'queue': 'q',
         'email': 'M',
         'project': 'P',
@@ -86,7 +103,11 @@ class Qsub:
         self.cores = None
 
     def __setattr__(self, key, value):
-        if key in self.para_map:
+        if isinstance(value, Resource):
+            param = Param('l', key, f'{key}={value.value}')
+            super().__setattr__(key, value.value)
+            self.parameters[key] = param
+        elif key in self.para_map:
             handler = getattr(self, f'_{key}', None)
             if handler:
                 value = handler(value)
@@ -206,6 +227,7 @@ class MainParser:
     logger = logging.getLogger('pbs_sub')
     script_base = join(dirname(abspath(__file__)), 'run_scripts')
     local_server = server
+    user_groups = groups
 
     def __init__(self):
         self.base_args = []
@@ -261,9 +283,6 @@ class MainParser:
         default run script
         """
         run_script = join(cls.script_base, cls.__software__ + '.sh')
-        if not isfile(run_script):
-            cls.logger.error(f'you need to put the script {run_script} first')
-            exit(1)
         return run_script
 
     @classmethod
@@ -399,8 +418,13 @@ class MainParser:
         cores_per_numa = cls.get_queue_res(queue, 'ncpu_pernuma', server=server)
         cores_per_vnode = cls.get_queue_res(queue, 'ncpu_pernode', server=server)
         mem_per_host = cls.get_queue_res(queue, 'mem_perhost', server=server)
+        gpus = 0
         try:
-            host_num = ceil(cores / cores_per_host)
+            if gpu:
+                gpu_per_node = cls.get_queue_res(queue, 'ngpu_pernode', server=server)
+                host_num = ceil(cores / gpu_per_node)
+            else:
+                host_num = ceil(cores / cores_per_host)
         except ZeroDivisionError:
             cls.logger.error(f'queue config error, contact with {__author__}')
             exit(1)
@@ -413,16 +437,17 @@ class MainParser:
             mem = memory / host_num if memory else mem_per_host
         else:
             place = 'place=pack'
-            core = cores
+            if gpu:
+                gpus = cores
+                core = cores * cores_per_vnode // gpu_per_node
+            else:
+                core = cores
             mem = int(mem_per_host * core / cores_per_host) - 1
-        if cores_per_vnode < cores <= cores_per_numa:
+        if cores_per_vnode < core <= cores_per_numa:
             place += ':group=numa'
-        elif cores <= cores_per_vnode:
+        elif core <= cores_per_vnode:
             place += ':group=vnode'
         if gpu:
-            gpu_per_node = cls.get_queue_res(queue, 'ngpu_pernode', server=server)
-            gpus = core
-            core = core * cores_per_vnode // gpu_per_node
             select = f'select={host_num}:ngpus={gpus}:ncpus={core}'
         else:
             select = f'select={host_num}:ncpus={core}'
@@ -434,7 +459,7 @@ class MainParser:
             select += f':ompthreads={omp}'
         qsub.place = place
         qsub.select = select
-        return core
+        return core * host_num
 
     @classmethod
     def get_check_cores(cls, cores, max_cores, queue, server=None, mpi=True) -> int:
@@ -444,13 +469,13 @@ class MainParser:
         """
         if cores:
             cores_per_host = cls.get_queue_res(queue, 'ncpu_perhost', server=server)
-            cores_per_numa = cls.get_queue_res(queue, 'ncpu_pernuma', server=server)
-            cores_per_vnode = cls.get_queue_res(queue, 'ncpu_pernode', server=server)
+            cores_per_node = cls.get_queue_res(queue, 'ncpu_pernode', server=server)
+            cores_per_numa = cls.get_queue_res(queue, 'ncpu_pernuma', server=server, default=cores_per_node)
             error_conditions = [
                 mpi is False and cores > cores_per_host,
                 cores > cores_per_host and (cores > max_cores or cores % cores_per_host),
                 cores_per_numa < cores < cores_per_host and cores % cores_per_numa,
-                cores < cores_per_vnode
+                cores_per_node < cores < cores_per_numa and cores % cores_per_node,
             ]
             if any(error_conditions):
                 cls.logger.error('not valid cores')
@@ -500,19 +525,33 @@ class MainParser:
             cls.logger.error(f'not available queue for your team, please contact with {__author__}')
             exit(1)
         else:
+            nonshared_queues = []
+            shared_queues = []
+            for q in queues:
+                if q in ('gpu', 'debug'):
+                    continue
+                if q.startswith('share'):
+                    shared_queues.append(q)
+                else:
+                    nonshared_queues.append(q)
             queue_info = cls.all_free_cores(server)
-            sorted_queue = sorted(queues, key=lambda q: queue_info[q]['free'], reverse=True)
+            sorted_shared_queue = sorted(shared_queues, key=lambda q: queue_info[q]['free'], reverse=True)
+            sorted_queue = sorted(nonshared_queues, key=lambda q: queue_info[q]['free'], reverse=True)
+            sorted_queue.extend(sorted_shared_queue)
             cls.logger.debug(f'choosing queue in {sorted_queue} which have most cores')
+            if len(sorted_queue) == 0:
+                cls.logger.error('there is no valid queue for your team')
+                exit(1)
             q = sorted_queue[0]
             return q
 
     @classmethod
     def default_policy(cls, queue, cores, qsub, maxcores, jobfile=None, mpi=False, set_mem=False,
-                       gpu=False, memory=None, omp=None, script=None) -> tuple:
+                       gpu=False, memory=None, omp=None, script=None, software=None, check=True) -> tuple:
         """
         default pbs job settings for most case
         """
-        target_queue = cls.get_queue(queue, server=qsub.server)
+        target_queue = cls.get_queue(queue, server=qsub.server, software=software)
         qsub.queue = target_queue
         target_cores = cores if gpu else cls.get_check_cores(cores, maxcores, target_queue, qsub.server)
         cpus = cls.set_select(target_cores, target_queue, qsub, mpi=mpi, set_mem=set_mem, gpu=gpu, memory=memory, omp=omp)
@@ -521,12 +560,12 @@ class MainParser:
         if jobfile:
             jobfile = os.path.abspath(jobfile)
             qsub.jobfile = jobfile
-            if not os.path.exists(jobfile):
+            if check and not os.path.exists(jobfile):
                 cls.logger.error(f'{jobfile} does not exist')
                 exit(1)
             workdir = jobfile if os.path.isdir(jobfile) else os.path.dirname(jobfile)
             os.chdir(workdir)
-            qsub.output = workdir
+            qsub.output = fixpath(workdir)
             cls.set_project(qsub, jobfile)
             if not getattr(qsub, 'jobname', None):
                 qsub.jobname = cls.fix_jobname(os.path.basename(jobfile))
@@ -560,7 +599,7 @@ class MainParser:
         server = args.server
         qsub = Qsub(self.logger, server=server)
         software = args.software
-        qsub.email = user + '@nio.com'
+        qsub.email = email
         if args.hold:
             qsub.hold = True
         waitfor = args.wait
