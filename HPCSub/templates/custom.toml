@@ -1,0 +1,7 @@
+Name="custom"
+MaxCores = 16
+DefaultMinCores = 1
+MPI = false
+TinyJob = true
+Description = "Custom script wrapper"
+Type = "user-script"
